@@ -1,8 +1,9 @@
 """Dispatcher + Telegram transport abstraction for the paper-trading bot.
 
 :class:`Dispatcher` turns a parsed :class:`~telegram_crypto_trading_bot.commands.Command`
-into a human-readable reply, executing trades against a :class:`PaperAccount`
-and reading prices from a :class:`PriceSource`.
+into a human-readable reply, executing trades against a :class:`PaperAccount`,
+reading prices from a :class:`PriceSource`, and enforcing a :class:`RiskLimits`
+policy on every buy.
 
 The Telegram transport is abstracted behind :class:`Transport` so the bot runs
 and tests without a token; :class:`InMemoryTransport` is a fake for tests/demos.
@@ -20,12 +21,25 @@ from telegram_crypto_trading_bot.commands import (
     Balance,
     Command,
     CommandError,
+    Help,
+    History,
+    Pnl,
+    Positions,
     Price,
+    ShowPortfolio,
+    ShowRisk,
     Side,
     Trade,
     parse_command,
 )
-from telegram_crypto_trading_bot.paper import PaperAccount
+from telegram_crypto_trading_bot.keyboard import callback_text
+from telegram_crypto_trading_bot.paper import (
+    InsufficientFundsError,
+    InsufficientPositionError,
+    PaperAccount,
+    build_portfolio,
+)
+from telegram_crypto_trading_bot.risk import RiskError, RiskLimits, check_trade
 
 
 @runtime_checkable
@@ -57,6 +71,10 @@ class StaticPriceSource:
         if key not in self._prices:
             raise KeyError(key)
         return self._prices[key]
+
+    def snapshot(self) -> dict[str, float]:
+        """Return a copy of the full price table (symbol -> price)."""
+        return dict(self._prices)
 
 
 @runtime_checkable
@@ -91,16 +109,23 @@ class InMemoryTransport:
 
 
 class Dispatcher:
-    """Executes parsed commands against an account and a price source.
+    """Executes parsed commands against an account, price source, and risk policy.
 
     Args:
         account: The paper-trading account to mutate.
-        prices: The price source used for trades and ``/price`` queries.
+        prices: The price source used for trades and reporting.
+        limits: Risk policy enforced on every buy. Defaults to unlimited.
     """
 
-    def __init__(self, account: PaperAccount, prices: PriceSource) -> None:
+    def __init__(
+        self,
+        account: PaperAccount,
+        prices: PriceSource,
+        limits: RiskLimits | None = None,
+    ) -> None:
         self.account = account
         self.prices = prices
+        self.limits = limits or RiskLimits.unlimited()
 
     def dispatch(self, command: Command) -> str:
         """Execute ``command`` and return a reply string.
@@ -117,13 +142,25 @@ class Dispatcher:
             return self._handle_balance()
         if isinstance(command, Price):
             return self._handle_price(command)
+        if isinstance(command, Positions):
+            return self._handle_positions()
+        if isinstance(command, ShowPortfolio):
+            return self._handle_portfolio()
+        if isinstance(command, Pnl):
+            return self._handle_pnl()
+        if isinstance(command, History):
+            return self._handle_history(command)
+        if isinstance(command, ShowRisk):
+            return self._handle_risk()
+        if isinstance(command, Help):
+            return self._handle_help()
         return f"ERROR: unsupported command {type(command).__name__}"
 
     def handle_text(self, text: str) -> str:
         """Parse ``text`` and dispatch it, returning a reply.
 
-        Parsing and execution errors are caught and rendered as ``ERROR: ...``
-        replies so a single bad message never crashes the bot loop.
+        Parsing, risk, and execution errors are caught and rendered as
+        ``ERROR: ...`` replies so a single bad message never crashes the loop.
 
         Args:
             text: Raw inbound message text.
@@ -134,19 +171,53 @@ class Dispatcher:
         try:
             command = parse_command(text)
             return self.dispatch(command)
-        except (CommandError, KeyError, ValueError) as exc:
+        except (CommandError, RiskError, KeyError, ValueError) as exc:
             detail = exc.args[0] if exc.args else str(exc)
             return f"ERROR: {detail}"
 
+    def handle_callback(self, callback_data: str) -> str:
+        """Handle an inline-keyboard tap by mapping it to a command.
+
+        Args:
+            callback_data: The opaque payload from a tapped button.
+
+        Returns:
+            The dispatched reply, or an ``ERROR:`` line on an unknown payload.
+        """
+        try:
+            text = callback_text(callback_data)
+        except ValueError as exc:
+            return f"ERROR: {exc}"
+        return self.handle_text(text)
+
+    def _marks(self) -> dict[str, float]:
+        """Best-effort mark prices for held symbols (avg cost if unquoted)."""
+        marks: dict[str, float] = {}
+        for sym, pos in self.account.open_positions.items():
+            try:
+                marks[sym] = self.prices.get_price(sym)
+            except KeyError:
+                marks[sym] = pos.avg_price
+        return marks
+
     def _handle_trade(self, trade: Trade) -> str:
         price = self.prices.get_price(trade.symbol)
+        decision = check_trade(trade, price, self.account, self.limits)
+        if not decision.allowed:
+            return f"ERROR: rejected by risk policy ({decision.reason})"
         if trade.side is Side.BUY:
-            cost = self.account.buy(trade.symbol, trade.quantity, price)
+            try:
+                cost = self.account.buy(trade.symbol, trade.quantity, price)
+            except InsufficientFundsError as exc:
+                return f"ERROR: {exc}"
             return (
                 f"BOUGHT {trade.quantity:g} {trade.symbol} @ {price:.2f} "
                 f"(cost {cost:.2f}); cash {self.account.cash:.2f}"
             )
-        proceeds = self.account.sell(trade.symbol, trade.quantity, price)
+        try:
+            proceeds = self.account.sell(trade.symbol, trade.quantity, price)
+        except InsufficientPositionError as exc:
+            return f"ERROR: {exc}"
         return (
             f"SOLD {trade.quantity:g} {trade.symbol} @ {price:.2f} "
             f"(proceeds {proceeds:.2f}); cash {self.account.cash:.2f}"
@@ -163,6 +234,83 @@ class Dispatcher:
     def _handle_price(self, price: Price) -> str:
         quote = self.prices.get_price(price.symbol)
         return f"{price.symbol} = {quote:.2f}"
+
+    def _handle_positions(self) -> str:
+        positions = self.account.open_positions
+        if not positions:
+            return "No open positions."
+        lines = ["Open positions:"]
+        for sym, pos in sorted(positions.items()):
+            lines.append(
+                f"  {sym}: {pos.quantity:g} @ avg {pos.avg_price:.2f} (basis {pos.cost_basis:.2f})"
+            )
+        return "\n".join(lines)
+
+    def _handle_portfolio(self) -> str:
+        portfolio = build_portfolio(self.account, self._marks())
+        lines = [
+            "Portfolio:",
+            f"  Cash: {portfolio.cash:.2f}",
+        ]
+        for row in portfolio.rows:
+            lines.append(
+                f"  {row.symbol}: {row.quantity:g} @ {row.mark:.2f} "
+                f"= {row.market_value:.2f} "
+                f"(uPnL {row.unrealized_pnl:+.2f} / {row.unrealized_pct:+.2f}%)"
+            )
+        lines.append(f"  Equity: {portfolio.equity:.2f}")
+        lines.append(
+            f"  Total PnL: {portfolio.total_pnl:+.2f} ({portfolio.total_return_pct:+.2f}%)"
+        )
+        return "\n".join(lines)
+
+    def _handle_pnl(self) -> str:
+        marks = self._marks()
+        realized = self.account.realized_pnl
+        unrealized = self.account.unrealized_pnl(marks)
+        total = realized + unrealized
+        return f"PnL - realized {realized:+.2f} | unrealized {unrealized:+.2f} | total {total:+.2f}"
+
+    def _handle_history(self, history: History) -> str:
+        fills = self.account.fills
+        if not fills:
+            return "No trade history."
+        if history.limit is not None:
+            fills = fills[-history.limit :]
+        lines = ["Trade history:"]
+        for fill in fills:
+            verb = fill.side.value.upper()
+            extra = f" rPnL {fill.realized_pnl:+.2f}" if fill.side is Side.SELL else ""
+            lines.append(
+                f"  #{fill.seq} {verb} {fill.quantity:g} {fill.symbol} @ {fill.price:.2f}{extra}"
+            )
+        return "\n".join(lines)
+
+    def _handle_risk(self) -> str:
+        lines = ["Risk limits:"]
+        lines.extend(f"  {line}" for line in self.limits.describe())
+        open_count = len(self.account.positions)
+        if self.limits.max_open_positions is not None:
+            lines.append(f"  Usage: {open_count}/{self.limits.max_open_positions} positions open")
+        else:
+            lines.append(f"  Usage: {open_count} positions open")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _handle_help() -> str:
+        return (
+            "Commands:\n"
+            "  /buy <SYM> <QTY>   buy at market\n"
+            "  /sell <SYM> <QTY>  sell at market\n"
+            "  /price <SYM>       quote a symbol\n"
+            "  /balance           cash + holdings\n"
+            "  /positions         open positions w/ cost basis\n"
+            "  /portfolio         full mark-to-market table\n"
+            "  /pnl               realized + unrealized PnL\n"
+            "  /history [N]       recent fills\n"
+            "  /risk              active risk limits\n"
+            "  /help              this message"
+        )
 
 
 def run_once(dispatcher: Dispatcher, transport: Transport) -> list[str]:
