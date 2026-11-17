@@ -78,10 +78,10 @@ limits = RiskLimits(max_order_notional=50_000.0, max_open_positions=5)
 
 bot = Dispatcher(account, prices, limits=limits)
 
-print(bot.handle_text("/buy BTC 1"))     # BOUGHT 1 BTC @ 30000.00 ...
-print(bot.handle_text("/buy ETH 5"))     # BOUGHT 5 ETH @ 2000.00 ...
-print(bot.handle_text("/pnl"))           # PnL - realized +0.00 | unrealized ...
-print(bot.handle_text("/buy BTC 100"))   # ERROR: rejected by risk policy (...)
+print(bot.handle_text("/buy BTC 1"))  # BOUGHT 1 BTC @ 30000.00 ...
+print(bot.handle_text("/buy ETH 5"))  # BOUGHT 5 ETH @ 2000.00 ...
+print(bot.handle_text("/pnl"))  # PnL - realized +0.00 | unrealized ...
+print(bot.handle_text("/buy BTC 100"))  # ERROR: rejected by risk policy (...)
 
 # A mark-to-market snapshot any time:
 snap = build_portfolio(account, {"BTC": 31_000.0, "ETH": 2_050.0})
@@ -105,7 +105,7 @@ Wire up an inline keyboard and handle a button tap:
 ```python
 from telegram_crypto_trading_bot.keyboard import main_menu, quick_trade
 
-reply_markup = main_menu().to_telegram()        # -> Telegram reply_markup dict
+reply_markup = main_menu().to_telegram()  # -> Telegram reply_markup dict
 reply = bot.handle_callback("cmd:buy BTC 0.5")  # tap -> "/buy BTC 0.5" -> reply
 ```
 
